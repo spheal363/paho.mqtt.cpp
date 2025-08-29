@@ -51,6 +51,9 @@ set(EXECUTABLES
     ws_publish
 )
 
+# Add subdirectory for reconnect-on-server-ref-latency example
+add_subdirectory(reconnect-on-server-ref-latency)
+
 # These will only be built if SSL selected
 if(PAHO_WITH_SSL)
     set(SSL_EXECUTABLES ssl_publish)
