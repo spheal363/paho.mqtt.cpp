@@ -10,7 +10,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
 # 設定
-CSV_FILE="${1:-fullcol_1year.csv}"
+CSV_FILE="${1:-fullcol_2week.csv}"
 BUILD_DIR="${PROJECT_ROOT}/build"
 BIN_DIR="${BUILD_DIR}/examples/reconnect-on-server-ref-latency"
 TEST_BINARY="${BIN_DIR}/reconnect_on_server_ref_latency_test"
@@ -199,7 +199,7 @@ run_test() {
     log_info "テスト開始: $TEST_BINARY $CSV_FILE"
     log_info "MQTTブローカー: 10.20.22.172:1883, 10.20.22.173:1883"
     log_info "トピック: traffic/data"
-    log_info "QoS: 1"
+    log_info "QoS: 0"
     
     # テスト実行
     "$TEST_BINARY" "$CSV_FILE"

@@ -47,7 +47,7 @@ using namespace std;
 
 // Constants
 const string TOPIC = "traffic/data";
-const int SPEED_MULTIPLIER = 40000; // 40,000倍のスピード
+const int SPEED_MULTIPLIER = 2000;
 
 // 許可されたID（138個のみ処理対象）
 static const std::unordered_set<int> kAllowedIds = {
@@ -86,13 +86,14 @@ public:
 struct TrafficData {
     int id;                    // ID（数値）
     string raw_csv_line;       // 生CSV行（JSON構築を避ける）
+    string json_payload;       // JSON形式のペイロード
     chrono::system_clock::time_point timestamp;  // タイムスタンプ
+    int64_t sent_at;           // 送信時刻（UNIXミリ秒）
     
-    TrafficData() : id(0), timestamp(chrono::system_clock::now()) {}
+    TrafficData() : id(0), timestamp(chrono::system_clock::now()), sent_at(0) {}
 };
 
-// 文字列エスケープ関数（現在は使用していないが、将来の拡張用に保持）
-/*
+// JSON文字列エスケープ関数
 string escape_json_string(const string& input) {
     string result;
     result.reserve(input.length() * 2);
@@ -119,7 +120,6 @@ string escape_json_string(const string& input) {
     }
     return result;
 }
-*/
 
 // タイムスタンプ取得関数
 string get_timestamp() {
@@ -382,6 +382,9 @@ private:
     
     // 再接続で削除された件数を記録するカウンタ
     std::atomic<size_t> dropped_count{0};
+    
+    // パブリッシュされたメッセージ数を記録するカウンタ（サイズ表示用）
+    std::atomic<size_t> published_count{0};
 
 public:
     MqttClientManager(const string& id, const string& uri, function<void(const string&)> reconnect_cb)
@@ -613,10 +616,24 @@ private:
             }
             
             try {
-                const std::string& payload = data.raw_csv_line;
+                // 送信時刻を設定
+                auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::system_clock::now().time_since_epoch()).count();
+                data.sent_at = now_ms;
+                
+                // payloadを組み立て: <unix_ms_timestamp>ts_sep_flag<json_payload>
+                std::string payload = std::to_string(now_ms) + "ts_sep_flag" + data.json_payload;
                 
                 if (payload.empty() || payload.length() > 10000) {
                     continue;
+                }
+                
+                // メッセージサイズを表示（最初の5件と、その後は1000件ごと）
+                size_t pub_count = published_count.fetch_add(1) + 1;
+                if (pub_count <= 5 || pub_count % 1000 == 0) {
+                    size_t payload_size = payload.size();
+                    cout << "[" << get_timestamp() << "] Client ID: " << client_id 
+                         << " - Message size: " << payload_size << " bytes (published: " << pub_count << ")" << endl;
                 }
                 
                 bool publish_success = false;
@@ -629,14 +646,19 @@ private:
                                 continue;
                             }
                             
+                            // MQTT v5のユーザープロパティでsent_atを設定
+                            mqtt::properties props;
+                            props.add({mqtt::property::USER_PROPERTY, "sent_at", std::to_string(now_ms)});
+                            
                             // 再利用可能なメッセージのpayload部分だけ書き換え（メモリ確保削減）
                             if (reusable_message) {
                                 reusable_message->set_payload(payload);
+                                reusable_message->set_properties(props);
                                 client->publish(reusable_message);
                                 publish_success = true;
                             } else {
-                                // フォールバック：直接publish
-                                client->publish(TOPIC, payload, 0, false);
+                                // フォールバック：直接publish（プロパティ付き）
+                                client->publish(TOPIC, payload, 0, false, props);
                                 publish_success = true;
                             }
                             
@@ -749,6 +771,14 @@ private:
     };
 };
 
+// CSVフィールドから引用符を除去するヘルパー関数
+string remove_quotes(const string& s) {
+    if (s.length() >= 2 && s.front() == '"' && s.back() == '"') {
+        return s.substr(1, s.length() - 2);
+    }
+    return s;
+}
+
 // CSVプロセッサー（ヘッダー名を使用）
 class CsvProcessor {
 private:
@@ -771,9 +801,11 @@ public:
         string field;
         stringstream hs(header_line);
         for (int i = 0; getline(hs, field, ','); ++i) {
-            headers_.push_back(field);
-            if (field == "ID") idx_id_ = i;
-            if (field == "DATA_AS_OF") idx_ts_ = i;
+            // 引用符を除去
+            string cleaned_field = remove_quotes(field);
+            headers_.push_back(cleaned_field);
+            if (cleaned_field == "ID") idx_id_ = i;
+            if (cleaned_field == "DATA_AS_OF") idx_ts_ = i;
         }
         
         // idx_id_ と idx_ts_ が見つからなければエラー扱いでもOK
@@ -810,7 +842,8 @@ public:
             string f;
             stringstream ss(line);
             while (getline(ss, f, ',')) {
-                cols.push_back(f);
+                // 引用符を除去
+                cols.push_back(remove_quotes(f));
             }
         }
         
@@ -839,8 +872,22 @@ public:
                 
                 // 検出されたフォーマットのみを使用（分岐なし）
                 if (use_ampm_format_) {
-                    if (!(time_ss >> get_time(&timeinfo, "%m/%d/%Y %I:%M:%S %p"))) {
-                        data.timestamp = chrono::system_clock::now();
+                    // 実際のCSV形式: "2025 Nov 01 12:03:03 AM"
+                    if (!(time_ss >> get_time(&timeinfo, "%Y %b %d %I:%M:%S %p"))) {
+                        // フォールバック: "11/01/2025 12:03:03 AM"形式も試す
+                        time_ss.clear();
+                        time_ss.str(ts);
+                        if (!(time_ss >> get_time(&timeinfo, "%m/%d/%Y %I:%M:%S %p"))) {
+                            data.timestamp = chrono::system_clock::now();
+                        } else {
+                            timeinfo.tm_isdst = -1;
+                            time_t tt = mktime(&timeinfo);
+                            if (tt == -1) {
+                                data.timestamp = chrono::system_clock::now();
+                            } else {
+                                data.timestamp = chrono::system_clock::from_time_t(tt);
+                            }
+                        }
                     } else {
                         timeinfo.tm_isdst = -1;
                         time_t tt = mktime(&timeinfo);
@@ -872,6 +919,61 @@ public:
         
         // 生CSV行をそのまま保存（JSON構築を避けて高速化）
         data.raw_csv_line = line;
+        
+        // JSON形式のペイロードを構築（IDとDATA_AS_OFを除く）
+        stringstream json_ss;
+        json_ss << "{";
+        
+        bool first_field = true;
+        for (size_t i = 0; i < headers_.size(); ++i) {
+            // IDとDATA_AS_OFフィールドをスキップ
+            if (i == (size_t)idx_id_ || i == (size_t)idx_ts_) {
+                continue;
+            }
+            
+            if (!first_field) {
+                json_ss << ",";
+            }
+            first_field = false;
+            
+            // フィールド名をエスケープして追加
+            json_ss << "\"" << escape_json_string(headers_[i]) << "\":";
+            
+            // 値の処理
+            if (i < cols.size()) {
+                string value = cols[i];
+                
+                // 数値かどうかを判定
+                bool is_numeric = false;
+                try {
+                    if (!value.empty()) {
+                        // 小数点を含むかチェック
+                        if (value.find('.') != string::npos) {
+                            stod(value);
+                        } else {
+                            stoi(value);
+                        }
+                        is_numeric = true;
+                    }
+                } catch (...) {
+                    is_numeric = false;
+                }
+                
+                if (is_numeric) {
+                    // 数値の場合はそのまま出力
+                    json_ss << value;
+                } else {
+                    // 文字列の場合はエスケープして出力
+                    json_ss << "\"" << escape_json_string(value) << "\"";
+                }
+            } else {
+                // カラム数が足りない場合は空文字列
+                json_ss << "\"\"";
+            }
+        }
+        
+        json_ss << "}";
+        data.json_payload = json_ss.str();
         
         return true;
     }
@@ -922,7 +1024,7 @@ int main(int argc, char* argv[]) {
 
         
         // ブローカーURLの定義
-        vector<string> broker_urls = {"tcp://10.20.22.172:1883", "tcp://10.20.22.173:1883"};
+        vector<string> broker_urls = {"tcp://10.20.22.172:1883","tcp://10.20.22.173:1883", "tcp://10.20.22.168:1883"};
         
         // 許可IDを昇順に並べて、ブローカーにラウンドロビンで割り当て
         std::vector<int> allowed_ids_sorted(kAllowedIds.begin(), kAllowedIds.end());
